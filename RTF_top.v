@@ -1,22 +1,42 @@
 `timescale 1ns / 1ps
 module RTF_top #(
+    // basic setting
     parameter MIC_NUM              = 8,
     parameter SOR_NUM              = 2,
     parameter FREQ_NUM             = 257,
+
+    // Data width
     parameter DATA_WIDTH           = 16,
+    parameter ACC_WIDTH            = 33,
+    parameter INV_G_WIDTH          = 105,
+    parameter INPUT_FRAC_BITS      = 14,
+
+    // bram read data latency
     parameter LATENCY              = 2,
-    parameter BRAM_RD_ADDR_WIDTH   = 14,
-    parameter BRAM_WR_ADDR_WIDTH   = 32,
+
+    // bram address width and start point
+    parameter BRAM_RD_ADDR_WIDTH   = 13,
+    parameter BRAM_WR_ADDR_WIDTH   = 13,
     parameter BRAM_RD_ADDR_BASE    = 0,
     parameter BRAM_WR_ADDR_BASE    = 0,
-    parameter BRAM_RD_INCREASE     = 2, // 16 / 8 = 2
-    parameter BRAM_WR_INCREASE     = 8, // 64 / 8 = 8
     parameter BRAM_WR_WE_WIDTH     = 8,
-    parameter DIVOUT_TDATA_WIDTH   = 64,
-    parameter DIVOUT_F_WIDTH       = 32,
-    parameter DIVISOR_TDATA_WIDTH  = 32,
-    parameter DIVIDEND_TDATA_WIDTH = 16,
-    parameter LAMBDA               = 32'd2684355
+
+    // bram address increase number
+    parameter BRAM_RD_INCREASE     = 1,  
+    parameter BRAM_WR_INCREASE     = 1, 
+
+    // divider data width
+    parameter DIVOUT_TDATA_WIDTH   = 72,
+    parameter DIVOUT_F_WIDTH       = 24, // Vivado divider: MSB of frac is sign, so 24 (1 sign + 23 frac)
+    parameter DIVOUT_GUARD_BITS    = 0,
+    parameter DIVISOR_TDATA_WIDTH  = 64,
+    parameter DIVIDEND_TDATA_WIDTH = 48,
+
+    // 1 = dynamic det_shift (like software), 0 = fixed DET_SCALE_SHIFT
+    parameter USE_DYNAMIC_DET_SHIFT = 1,
+
+    // lambda number
+    parameter LAMBDA                = 33'd2684355
 )(
     input                                        clk,
     input                                        rst_n,
@@ -30,8 +50,8 @@ module RTF_top #(
     output reg        [BRAM_RD_ADDR_WIDTH-1:0]   bram_rd_addr,
 
     // write bram data
-    output reg signed [DATA_WIDTH*4-1:0]         result_bram_wr_real,
-    output reg signed [DATA_WIDTH*4-1:0]         result_bram_wr_imag,
+    output reg signed [INV_G_WIDTH-1:0]          result_bram_wr_real,
+    output reg signed [INV_G_WIDTH-1:0]          result_bram_wr_imag,
     output reg        [BRAM_WR_ADDR_WIDTH-1:0]   bram_wr_addr,
     output            [BRAM_WR_WE_WIDTH-1:0]     bram_wr_we,
     output                                       bram_wr_en,
@@ -57,15 +77,23 @@ module RTF_top #(
     localparam S_INVDET         = 7;  // set dividend and divisor to divider
     localparam S_SETDIV         = 8;  // set dividend and divisor valid to divider
     localparam S_WAITDIV        = 9;  // wait divider result
-    localparam S_CALINVG        = 10;  // calculate inverse of G
+    localparam S_CALINVG        = 10; // calculate inverse of G
     localparam S_CALRESULT      = 11; // calculate result elements
     localparam S_WR             = 12; // write result to bram
     localparam S_UPDATE_WR_ADDR = 13; // update bram write address
     localparam S_DONE           = 14; // done
     localparam S_RESTART        = 15; // return to S_RD
 
-    localparam TOTAL_NUM = MIC_NUM * SOR_NUM * FREQ_NUM; // 8 * 2 * 257 = 4112
-    localparam PER_FREQ  = MIC_NUM * SOR_NUM;
+    localparam TOTAL_NUM          = MIC_NUM * SOR_NUM * FREQ_NUM;                                                      // 8 * 2 * 257 = 4112
+    localparam PER_FREQ           = MIC_NUM * SOR_NUM;                                                                 // 8 * 2 = 16
+    localparam DET_WIDTH          = ACC_WIDTH * 2;                                                                     // 33 * 2 = 66
+    localparam DET_FRAC_BITS      = 4 * INPUT_FRAC_BITS;                                                               // 14 * 4 = 56
+    localparam DIVOUT_Q_WIDTH     = DIVOUT_TDATA_WIDTH - DIVOUT_F_WIDTH;                                               // 72 - 24 = 48
+    localparam DIVIDEND_SHIFT     = (DIVOUT_F_WIDTH - 1) + DET_FRAC_BITS + DIVOUT_GUARD_BITS;                          // 15 + 56 + 0 = 71
+    localparam DIVIDEND_MAX_SHIFT = DIVIDEND_TDATA_WIDTH - 1;                                                          // 47
+    localparam DET_SCALE_SHIFT    = (DIVIDEND_SHIFT > DIVIDEND_MAX_SHIFT) ? (DIVIDEND_SHIFT - DIVIDEND_MAX_SHIFT) : 0; // 71 - 47 = 24
+    localparam TARGET_BITS        = DIVOUT_F_WIDTH + 1;                                                                // software: det_bits - this
+    localparam [6:0] DET_SCALE_SHIFT_7 = DET_SCALE_SHIFT;
 
     // ==============================
     // bram start delay
@@ -81,7 +109,7 @@ module RTF_top #(
     end
 
     // ==============================
-    // FSM
+    // FSM setting
     // ==============================
     reg [3:0] state;
     reg [3:0] next_state;
@@ -105,41 +133,100 @@ module RTF_top #(
     // G = a(f)h * a(f) + lambda * I register
     // note1: g21 = g12 conjugate, so we only need store g11, g12, g22.
     // note2: g11 and g22 only have real part, so we only need store real part of g11 and g22
-    reg signed [DATA_WIDTH*2-1:0] g11_real_acc;
-    reg signed [DATA_WIDTH*2-1:0] g12_real_acc;
-    reg signed [DATA_WIDTH*2-1:0] g12_imag_acc;
-    reg signed [DATA_WIDTH*2-1:0] g22_real_acc;
+    reg signed [ACC_WIDTH-1:0] g11_real_acc;
+    reg signed [ACC_WIDTH-1:0] g12_real_acc;
+    reg signed [ACC_WIDTH-1:0] g12_imag_acc;
+    reg signed [ACC_WIDTH-1:0] g22_real_acc;
 
     // square of g12 (avoid timing violation)
-    wire signed [DATA_WIDTH*2-1:0] g12_real_acc_sqr;
-    wire signed [DATA_WIDTH*2-1:0] g12_imag_acc_sqr;
+    wire signed [DET_WIDTH-1:0] g12_real_acc_sqr;
+    wire signed [DET_WIDTH-1:0] g12_imag_acc_sqr;
 
     assign g12_real_acc_sqr = g12_real_acc * g12_real_acc;
     assign g12_imag_acc_sqr = g12_imag_acc * g12_imag_acc;
 
     // det
-    reg  signed [DATA_WIDTH*2-1:0]         det;
-    reg  signed [DIVIDEND_TDATA_WIDTH-1:0] inv_det_q;
+    reg  signed [DET_WIDTH-1:0]            det;
+    reg  signed [DIVOUT_Q_WIDTH-1:0]       inv_det_q;
     reg  signed [DIVOUT_F_WIDTH-1:0]       inv_det_f;
     wire signed [DIVOUT_TDATA_WIDTH-1:0]   inv_det;
 
     // inverse G register
-    reg signed [DATA_WIDTH*4-1:0] inv_g11_real;
-    reg signed [DATA_WIDTH*4-1:0] inv_g12_real;
-    reg signed [DATA_WIDTH*4-1:0] inv_g12_imag;
-    reg signed [DATA_WIDTH*4-1:0] inv_g22_real;
+    reg signed [INV_G_WIDTH-1:0] inv_g11_real;
+    reg signed [INV_G_WIDTH-1:0] inv_g12_real;
+    reg signed [INV_G_WIDTH-1:0] inv_g12_imag;
+    reg signed [INV_G_WIDTH-1:0] inv_g22_real;
 
     // result elements (avoid timing violation)
-    reg signed [DATA_WIDTH*4-1:0] result_real_element0;
-    reg signed [DATA_WIDTH*4-1:0] result_real_element1;
-    reg signed [DATA_WIDTH*4-1:0] result_real_element2;
-    reg signed [DATA_WIDTH*4-1:0] result_imag_element0;
-    reg signed [DATA_WIDTH*4-1:0] result_imag_element1;
-    reg signed [DATA_WIDTH*4-1:0] result_imag_element2;
+    reg signed [INV_G_WIDTH-1:0] result_real_element0;
+    reg signed [INV_G_WIDTH-1:0] result_real_element1;
+    reg signed [INV_G_WIDTH-1:0] result_real_element2;
+    reg signed [INV_G_WIDTH-1:0] result_imag_element0;
+    reg signed [INV_G_WIDTH-1:0] result_imag_element1;
+    reg signed [INV_G_WIDTH-1:0] result_imag_element2;
 
+    // ==============================
+    // divider input
+    // ==============================
 
-    assign inv_det         = ($signed(inv_det_q) <<< (DIVOUT_F_WIDTH - 1)) + $signed(inv_det_f);
+    wire signed [DIVIDEND_TDATA_WIDTH-1:0] dividend_scaled;
+    wire signed [DET_WIDTH-1:0]            det_scaled;
+    wire signed [DIVISOR_TDATA_WIDTH-1:0]  det_scaled_div;
+    wire signed [DIVISOR_TDATA_WIDTH-1:0]  det_scaled_abs;
+    wire signed [DIVISOR_TDATA_WIDTH-1:0]  det_half;
+    wire signed [DIVIDEND_TDATA_WIDTH-1:0] dividend_rounded;
 
+    // Dynamic det_shift (like software): det_shift = max(0, bit_length(|det|) - (DIVOUT_F_WIDTH+1)).
+    wire [DET_WIDTH-1:0] det_mag;
+    reg  [6:0]           lead_one_idx;
+    wire [6:0]           det_bits;
+    wire [6:0]           det_shift_dyn;
+    wire [6:0]           det_shift_use;
+    reg  [6:0]           det_shift_r;
+    integer              lod_i;
+
+    assign det_mag       = (det[DET_WIDTH-1]) ? (-det) : det;
+    assign det_bits      = (|det_mag) ? (lead_one_idx + 1'b1) : 7'b0;
+    assign det_shift_dyn = (det_bits >= TARGET_BITS) ? (det_bits - TARGET_BITS) : 7'b0;
+    assign det_shift_use = USE_DYNAMIC_DET_SHIFT ? det_shift_dyn : DET_SCALE_SHIFT_7;
+
+    // Scan low to high so the last set bit index is the leading one (MSB).
+    always @(*) begin
+        lead_one_idx = 0;
+        for (lod_i = 0; lod_i <= DET_WIDTH - 1; lod_i = lod_i + 1)
+            if (det_mag[lod_i])
+                lead_one_idx = lod_i[6:0];
+    end
+
+    // Scale det: fixed or dynamic shift so divisor fits divider width.
+    assign det_scaled       = det >>> det_shift_use;
+    assign det_scaled_div   = det_scaled[DIVISOR_TDATA_WIDTH-1:0];
+    assign det_scaled_abs   = (det_scaled_div[DIVISOR_TDATA_WIDTH-1]) ? -det_scaled_div : det_scaled_div;
+    assign det_half         = det_scaled_abs >>> 1;
+    // In 48-bit signed, 1<<47 is -2^47; we send this to signed divider then negate quotient for correct 1/det sign.
+    assign dividend_scaled  = ($signed({{(DIVIDEND_TDATA_WIDTH - 1){1'b0}}, 1'b1})) <<< DIVIDEND_MAX_SHIFT;
+
+    // Round-to-nearest: add +/- (|det|/2) before division.
+    wire det_scaled_div_zero;
+
+    assign det_scaled_div_zero = (det_scaled_div == 0);
+    assign dividend_rounded = det_scaled_div_zero ? 0 : ((det_scaled_div[DIVISOR_TDATA_WIDTH-1]) ? (dividend_scaled - $signed(det_half)) : (dividend_scaled + $signed(det_half)));
+
+    // ==============================
+    // divider output
+    // ==============================
+    
+    wire signed [DIVOUT_TDATA_WIDTH-1:0] inv_det_raw;
+    wire inv_det_raw_zero;
+
+    assign inv_det_raw      = ($signed(inv_det_q) <<< (DIVOUT_F_WIDTH - 1)) + $signed(inv_det_f);
+    assign inv_det_raw_zero = (inv_det_q == 0) && (inv_det_f == 0);
+    // Dividend is -2^47 (signed), so quotient has opposite sign of 1/det; negate to get correct inv_det.
+    assign inv_det          = inv_det_raw_zero ? 0 : (-(inv_det_raw <<< (DIVIDEND_SHIFT - DIVIDEND_MAX_SHIFT)));
+
+    // ==============================
+    // FSM
+    // ==============================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= S_IDLE;
@@ -196,6 +283,7 @@ module RTF_top #(
 
             // det register
             det          <= 0;
+            det_shift_r  <= 0;
             inv_det_q    <= 0;
             inv_det_f    <= 0;
 
@@ -227,6 +315,8 @@ module RTF_top #(
                 S_IDLE: begin // state 0
                     done                 <= 0;
                     all_freq_finish      <= 0;
+                    bram_rd_addr         <= BRAM_RD_ADDR_BASE;
+                    bram_wr_addr         <= BRAM_WR_ADDR_BASE;
                     if (start_delay[LATENCY]) begin
                         for (i = 0; i < MIC_NUM; i = i + 1) begin
                             sor0_temp_real[i] <= 0;
@@ -245,6 +335,7 @@ module RTF_top #(
                         inv_g12_imag         <= 0;
                         inv_g22_real         <= 0;
                         det                  <= 0;
+                        det_shift_r          <= 0;
                         inv_det_q            <= 0;
                         inv_det_f            <= 0;
                         result_real_element0 <= 0;
@@ -257,30 +348,25 @@ module RTF_top #(
                         result_bram_wr_imag  <= 0;
                         flag_rd_sor1         <= 0;
                         result_row1          <= 0;
-                        bram_rd_addr         <= BRAM_RD_ADDR_BASE;
-                        bram_wr_addr         <= BRAM_WR_ADDR_BASE;
+                        wait_rd_change       <= 1;
                     end
                 end
                 S_RD: begin // state 1
-                    if (wait_rd_change) begin
-                        rd_cnt <= (rd_cnt == PER_FREQ - 1) ? rd_cnt : rd_cnt + 1;
-                        if (flag_rd_sor1) begin
-                            sor1_temp_real[sor_cnt] <= af_bram_rd_real;
-                            sor1_temp_imag[sor_cnt] <= af_bram_rd_imag;
-                            g22_real_acc            <= g22_real_acc + $signed(af_bram_rd_real) * $signed(af_bram_rd_real)
-                                                                    + $signed(af_bram_rd_imag) * $signed(af_bram_rd_imag);
-                            g12_real_acc            <= g12_real_acc + $signed(sor0_temp_real[sor_cnt]) * $signed(af_bram_rd_real)
-                                                                    + $signed(sor0_temp_imag[sor_cnt]) * $signed(af_bram_rd_imag);
-                            g12_imag_acc            <= g12_imag_acc + $signed(sor0_temp_real[sor_cnt]) * $signed(af_bram_rd_imag)
-                                                                    - $signed(sor0_temp_imag[sor_cnt]) * $signed(af_bram_rd_real);
-                        end else begin
-                            sor0_temp_real[sor_cnt] <= af_bram_rd_real;
-                            sor0_temp_imag[sor_cnt] <= af_bram_rd_imag;
-                            g11_real_acc            <= g11_real_acc + $signed(af_bram_rd_real) * $signed(af_bram_rd_real)
-                                                                    + $signed(af_bram_rd_imag) * $signed(af_bram_rd_imag);
-                        end
+                    rd_cnt <= (rd_cnt == PER_FREQ - 1) ? rd_cnt : rd_cnt + 1;
+                    if (flag_rd_sor1) begin
+                        sor1_temp_real[sor_cnt] <= af_bram_rd_real;
+                        sor1_temp_imag[sor_cnt] <= af_bram_rd_imag;
+                        g22_real_acc            <= g22_real_acc + $signed(af_bram_rd_real) * $signed(af_bram_rd_real)
+                                                                + $signed(af_bram_rd_imag) * $signed(af_bram_rd_imag);
+                        g12_real_acc            <= g12_real_acc + $signed(sor0_temp_real[sor_cnt]) * $signed(af_bram_rd_real)
+                                                                + $signed(sor0_temp_imag[sor_cnt]) * $signed(af_bram_rd_imag);
+                        g12_imag_acc            <= g12_imag_acc + $signed(sor0_temp_real[sor_cnt]) * $signed(af_bram_rd_imag)
+                                                                - $signed(sor0_temp_imag[sor_cnt]) * $signed(af_bram_rd_real);
                     end else begin
-                        wait_rd_change <= 1'b1;
+                        sor0_temp_real[sor_cnt] <= af_bram_rd_real;
+                        sor0_temp_imag[sor_cnt] <= af_bram_rd_imag;
+                        g11_real_acc            <= g11_real_acc + $signed(af_bram_rd_real) * $signed(af_bram_rd_real)
+                                                                + $signed(af_bram_rd_imag) * $signed(af_bram_rd_imag);
                     end
                 end
                 S_UPDATE_RD_ADDR: begin // state 2
@@ -290,11 +376,10 @@ module RTF_top #(
                 end
                 S_WAIT_RD_DELAY: begin // state 3
                     // just wait
-                    // wait_rd_change <= 1'b1;
                 end
                 S_PLUS: begin // state 4
-                    wait_rd_change <= 0;
-                    bram_rd_addr   <= bram_rd_addr + BRAM_RD_INCREASE;
+                    // wait_rd_change <= 0;
+                    bram_rd_addr   <= (wait_rd_change) ? bram_rd_addr + BRAM_RD_INCREASE : bram_rd_addr;
                     flag_rd_sor1   <= 0;
                     rd_cnt         <= 0;
                     sor_cnt        <= 0;
@@ -302,14 +387,17 @@ module RTF_top #(
                     g22_real_acc   <= g22_real_acc + $signed(LAMBDA);
                 end
                 S_CALDET1: begin // state 5
-                    det <= g11_real_acc * g22_real_acc;
+                    wait_rd_change <= 0;
+                    det            <= g11_real_acc * g22_real_acc;
                 end
                 S_CALDET2: begin // state 6
                     det <= det - (g12_real_acc_sqr + g12_imag_acc_sqr);
                 end
                 S_INVDET: begin // state 7
-                    s_axis_divisor_tdata  <= det;
-                    s_axis_dividend_tdata <= 1;
+                    // Only send to divider if det_scaled_div is non-zero
+                    s_axis_divisor_tdata  <= det_scaled_div_zero ? 1 : det_scaled_div;
+                    s_axis_dividend_tdata <= dividend_rounded;
+                    det_shift_r           <= det_shift_use;
                 end
                 S_SETDIV: begin // state 8
                     s_axis_divisor_tvalid  <= 1;
@@ -399,6 +487,7 @@ module RTF_top #(
                     result_bram_wr_imag  <= 0;
                     flag_rd_sor1         <= 0;
                     rd_cnt               <= 0;
+                    bram_rd_addr         <= bram_rd_addr + BRAM_RD_INCREASE;
                 end
                 default: begin
                     // bram addr

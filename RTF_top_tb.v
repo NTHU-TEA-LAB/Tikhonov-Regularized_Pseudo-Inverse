@@ -1,16 +1,18 @@
 `timescale 1ns / 1ps
 module RTF_top_tb ();
-    localparam DATA_WIDTH         = 16;
-    localparam BRAM_RD_ADDR_WIDTH = 32;
-    localparam BRAM_WR_ADDR_WIDTH = 32;
-    localparam BRAM_WR_WE_WIDTH   = 6;
-    localparam BRAM_RD_INCREASE   = 2;
-    localparam BRAM_WR_INCREASE   = 8;
-    localparam MIC_NUM            = 8;
-    localparam SOR_NUM            = 2;
-    localparam FREQ_NUM           = 257;
-    localparam PER_FREQ           = MIC_NUM * SOR_NUM;  // 16
-    localparam TOTAL_NUM          = MIC_NUM * SOR_NUM * FREQ_NUM;  // 4112
+    // Match RTF_top.v parameters
+    localparam DATA_WIDTH           = 16;
+    localparam INV_G_WIDTH          = 103;
+    localparam BRAM_RD_ADDR_WIDTH   = 14;
+    localparam BRAM_WR_ADDR_WIDTH   = 32;
+    localparam BRAM_WR_WE_WIDTH     = 8;
+    localparam BRAM_RD_INCREASE     = 2;
+    localparam BRAM_WR_INCREASE     = 8;
+    localparam MIC_NUM              = 8;
+    localparam SOR_NUM              = 2;
+    localparam FREQ_NUM             = 257;
+    localparam PER_FREQ             = MIC_NUM * SOR_NUM;  // 16
+    localparam TOTAL_NUM            = MIC_NUM * SOR_NUM * FREQ_NUM;  // 4112
 
     localparam PERIOD = 10;
 
@@ -22,8 +24,8 @@ module RTF_top_tb ();
     wire                                 done;
     wire                                 all_freq_finish;
     wire        [BRAM_RD_ADDR_WIDTH-1:0] bram_rd_addr;
-    wire signed [DATA_WIDTH*3-1:0]       result_bram_wr_real;
-    wire signed [DATA_WIDTH*3-1:0]       result_bram_wr_imag;
+    wire signed [INV_G_WIDTH-1:0]       result_bram_wr_real;
+    wire signed [INV_G_WIDTH-1:0]       result_bram_wr_imag;
     wire        [BRAM_WR_ADDR_WIDTH-1:0] bram_wr_addr;
     wire        [BRAM_WR_WE_WIDTH-1:0]   bram_wr_we;
     wire                                 bram_wr_en;
@@ -32,9 +34,9 @@ module RTF_top_tb ();
     reg signed [DATA_WIDTH-1:0] bram_rd_mem_real [0:TOTAL_NUM-1];
     reg signed [DATA_WIDTH-1:0] bram_rd_mem_imag [0:TOTAL_NUM-1];
 
-    // Simulated BRAM for write data
-    reg signed [DATA_WIDTH*3-1:0] bram_wr_mem_real [0:TOTAL_NUM-1];
-    reg signed [DATA_WIDTH*3-1:0] bram_wr_mem_imag [0:TOTAL_NUM-1];
+    // Simulated BRAM for write data (width matches RTF_top result_bram_wr_*)
+    reg signed [INV_G_WIDTH-1:0] bram_wr_mem_real [0:TOTAL_NUM-1];
+    reg signed [INV_G_WIDTH-1:0] bram_wr_mem_imag [0:TOTAL_NUM-1];
     reg                           bram_wr_valid    [0:TOTAL_NUM-1];
 
     integer i;
@@ -96,9 +98,8 @@ module RTF_top_tb ();
 
     always @(posedge clk) begin
         if (bram_wr_en && (bram_wr_we != 0)) begin
-            // Convert address to index: addr / increment
-            // BRAM_WR_ADDR_BASE is 0, BRAM_WR_INCREASE is 6
-            // Each data is 48 bits = 6 bytes, so divide by 6 to get index
+            // Convert address to index: addr / BRAM_WR_INCREASE (8)
+            // BRAM_WR_ADDR_BASE is 0
             if (bram_wr_addr >= 0 && wr_addr_index < TOTAL_NUM) begin
                 bram_wr_mem_real[wr_addr_index] <= result_bram_wr_real;
                 bram_wr_mem_imag[wr_addr_index] <= result_bram_wr_imag;
